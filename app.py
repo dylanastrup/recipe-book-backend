@@ -17,10 +17,19 @@ app = Flask(__name__)
 
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://recipes.dylanastrup.com"]}}, supports_credentials=True)
 
-# Database Configuration
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.join(BASE_DIR, "recipes.db")}'
+# --- START OF UPDATED SECTION ---
+# Database Configuration for Heroku and local fallback
+uri = os.environ.get('DATABASE_URL')
+if uri and uri.startswith("postgres://"):
+    uri = uri.replace("postgres://", "postgresql://", 1)
+else:
+    # Fallback to local SQLite database if DATABASE_URL is not set
+    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+    uri = f'sqlite:///{os.path.join(BASE_DIR, "recipes.db")}'
+
+app.config['SQLALCHEMY_DATABASE_URI'] = uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# --- END OF UPDATED SECTION ---
 
 db.init_app(app)
 migrate = Migrate(app,db)
