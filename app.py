@@ -12,6 +12,13 @@ from itsdangerous import URLSafeTimedSerializer
 from flask_jwt_extended import create_refresh_token, get_jwt, jwt_required, get_jwt_identity
 from sqlalchemy import String, cast
 
+# Block for debugging
+db_url = os.environ.get('DATABASE_URL')
+if not db_url:
+    raise ValueError("CRITICAL ERROR: DATABASE_URL environment variable not found!")
+print(f"DATABASE_URL FOUND: {db_url}")
+# End of debugging block
+
 
 app = Flask(__name__)
 
