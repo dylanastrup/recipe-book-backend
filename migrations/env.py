@@ -1,7 +1,7 @@
 import logging
 from logging.config import fileConfig
 
-# We import our app and db instances directly. This is the key change.
+# We import our app and db instances directly.
 from app import app
 from models import db
 
@@ -17,17 +17,11 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 logger = logging.getLogger('alembic.env')
 
-
-# --- START OF MODIFICATIONS ---
-
 # This forces alembic to use the database URL from our app's configuration.
-# This is what makes it connect to PostgreSQL on Render instead of a default SQLite.
 config.set_main_option('sqlalchemy.url', str(app.config.get('SQLALCHEMY_DATABASE_URI')))
 
 # We set the target metadata directly from our imported db object from models.py
 target_metadata = db.metadata
-
-# --- END OF MODIFICATIONS ---
 
 
 def run_migrations_offline() -> None:
@@ -52,7 +46,8 @@ def run_migrations_online() -> None:
     """
     # Create an engine from our app's configuration to connect to the database
     connectable = engine_from_config(
-        config.get_section(config.config_main_section, {}),
+        # This is the line that has been corrected
+        config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
