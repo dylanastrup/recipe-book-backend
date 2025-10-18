@@ -12,31 +12,26 @@ from itsdangerous import URLSafeTimedSerializer
 from flask_jwt_extended import create_refresh_token, get_jwt, jwt_required, get_jwt_identity
 from sqlalchemy import String, cast
 
-# Block for debugging
-db_url = os.environ.get('DATABASE_URL')
-if not db_url:
-    raise ValueError("CRITICAL ERROR: DATABASE_URL environment variable not found!")
-print(f"DATABASE_URL FOUND: {db_url}")
-# End of debugging block
-
 
 app = Flask(__name__)
 
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://recipes.dylanastrup.com"]}}, supports_credentials=True)
 
-# --- START OF UPDATED SECTION ---
-# Database Configuration for Heroku and local fallback
+# --- START OF CORRECTED SECTION ---
+# Database Configuration
 uri = os.environ.get('DATABASE_URL')
-if uri and uri.startswith("postgres://"):
-    uri = uri.replace("postgres://", "postgresql://", 1)
-else:
-    # Fallback to local SQLite database if DATABASE_URL is not set
+if uri:  # If the DATABASE_URL is set at all...
+    # Heroku URLs start with postgres://, but SQLAlchemy needs postgresql://
+    # This check is for future compatibility.
+    if uri.startswith("postgres://"):
+        uri = uri.replace("postgres://", "postgresql://", 1)
+else: # Otherwise, fall back to SQLite for local development
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
     uri = f'sqlite:///{os.path.join(BASE_DIR, "recipes.db")}'
 
 app.config['SQLALCHEMY_DATABASE_URI'] = uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-# --- END OF UPDATED SECTION ---
+# --- END OF CORRECTED SECTION ---
 
 db.init_app(app)
 migrate = Migrate(app,db)
@@ -47,7 +42,6 @@ jwt = JWTManager(app)
 
 
 # Import models from models folder
-
 from models.User import User
 from models.Recipe import Recipe
 from models.Ingredient import Ingredient
