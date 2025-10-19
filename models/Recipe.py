@@ -1,5 +1,6 @@
 from datetime import datetime
-from models import db 
+from models import db
+from .RecipeStep import RecipeStep # Added this import for sorting
 
 class Recipe(db.Model):
     __tablename__ = 'recipes'
@@ -17,7 +18,10 @@ class Recipe(db.Model):
 
     # Define relationships
     recipe_ingredient = db.relationship('RecipeIngredient', back_populates='recipe')
-    recipe_step = db.relationship('RecipeStep', back_populates='recipe')
+    
+    # This is the updated line
+    recipe_step = db.relationship('RecipeStep', back_populates='recipe', order_by=RecipeStep.step_number)
+    
     image = db.relationship('Image', back_populates='recipe')
     user = db.relationship('User', back_populates='recipe')
 
