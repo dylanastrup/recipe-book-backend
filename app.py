@@ -15,9 +15,16 @@ from sqlalchemy import String, cast, or_
 
 app = Flask(__name__)
 
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://recipes.dylanastrup.com"]}}, supports_credentials=True)
+CORS(app, 
+     resources={r"/api/*": {
+         "origins": ["http://localhost:3000", "https://recipes.dylanastrup.com"],
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "allow_headers": ["Content-Type", "Authorization"]
+     }}, 
+     supports_credentials=True
+)
 
-# --- START OF CORRECTED SECTION ---
+
 # Database Configuration
 uri = os.environ.get('DATABASE_URL')
 if uri:  # If the DATABASE_URL is set at all...
