@@ -10,7 +10,7 @@ import re
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
 from flask_jwt_extended import create_refresh_token, get_jwt, jwt_required, get_jwt_identity
-from sqlalchemy import String, cast
+from sqlalchemy import String, cast, or_
 
 
 app = Flask(__name__)
@@ -245,112 +245,62 @@ def test_route():
 @app.route('/api/recipes', methods=['GET'])
 @jwt_required()
 def get_recipes():
-    identity = get_jwt_identity()
-    user_id = identity.get("id") if isinstance(identity, dict) else identity
-    role = identity.get("role") if isinstance(identity, dict) else None
-
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    user_favorites = {recipe.id for recipe in user.favorite_recipes} # Get a set of favorite recipe IDs
     search = request.args.get('search', '').lower()
     sort_by = request.args.get('sort', '')
-
+    
     query = Recipe.query
 
-    # Apply search filter
     if search:
-        query = query.filter(
-            (Recipe.recipe_name.ilike(f"%{search}%")) |
-            (Recipe.cuisine.ilike(f"%{search}%")) |
-            (Recipe.recipe_description.ilike(f"%{search}%")) |
-            ((Recipe.prep_time + Recipe.cook_time).cast(String).ilike(f"%{search}%"))
-        )
+        # Changed .join() to .outerjoin() to include recipes with no tags
+        query = query.outerjoin(Recipe.tags).filter(
+            or_(
+                Recipe.recipe_name.ilike(f"%{search}%"),
+                Recipe.cuisine.ilike(f"%{search}%"),
+                Recipe.recipe_description.ilike(f"%{search}%"),
+                Tag.tag_name.ilike(f"%{search}%")
+            )
+        ).distinct()
 
-    # Sorting options
     sort_options = {
-        "recipe_name_asc": Recipe.recipe_name.asc(),
-        "recipe_name_desc": Recipe.recipe_name.desc(),
-        "cuisine_asc": Recipe.cuisine.asc(),
-        "cuisine_desc": Recipe.cuisine.desc(),
-        "total_time_asc": (Recipe.prep_time + Recipe.cook_time).asc(),
-        "total_time_desc": (Recipe.prep_time + Recipe.cook_time).desc(),
-        "difficulty_asc": Recipe.difficulty.asc(),
-        "difficulty_desc": Recipe.difficulty.desc(),
-        "servings_asc": Recipe.servings.asc(),
-        "servings_desc": Recipe.servings.desc(),
+        "recipe_name_asc": Recipe.recipe_name.asc(), "recipe_name_desc": Recipe.recipe_name.desc(),
+        "cuisine_asc": Recipe.cuisine.asc(), "cuisine_desc": Recipe.cuisine.desc(),
+        "total_time_asc": (Recipe.prep_time + Recipe.cook_time).asc(), "total_time_desc": (Recipe.prep_time + Recipe.cook_time).desc(),
+        "difficulty_asc": Recipe.difficulty.asc(), "difficulty_desc": Recipe.difficulty.desc(),
+        "servings_asc": Recipe.servings.asc(), "servings_desc": Recipe.servings.desc(),
     }
-
     if sort_by in sort_options:
         query = query.order_by(sort_options[sort_by])
-
+    else:
+        query = query.order_by(Recipe.created_at.desc())
+        
     recipes = query.all()
-    
     recipe_list = []
     for recipe in recipes:
-        ingredients_data = []
-        steps_data = []
-        tags_data = []
-        images_data = []
-
-        for recipe_ingredient in recipe.recipe_ingredient:
-            ingredient = recipe_ingredient.ingredient
-            measurement = recipe_ingredient.measurement
-            ingredients_data.append({
-                "ingredient_id": ingredient.id,
-                "ingredient_name": ingredient.ingredient_name,
-                "amount": recipe_ingredient.ingredient_quantity,
-                "measurement_unit": measurement.measurement_name if measurement else None
-            })
-
-        steps_data = [
-            {"step_number": step.step_number, "instruction": step.step_description}
-            for step in recipe.recipe_step
-        ]
-
-        tags_data = [tag.tag.name for tag in recipe.tags]
-        images_data = [image.image_url for image in recipe.image]
-
         recipe_list.append({
-            "id": recipe.id,
-            "recipe_name": recipe.recipe_name,
-            "description": recipe.recipe_description,
-            "cuisine": recipe.cuisine,
-            "prep_time": recipe.prep_time,
-            "cook_time": recipe.cook_time,
-            "total_time": recipe.prep_time + recipe.cook_time,
-            "servings": recipe.servings,
-            "difficulty": recipe.difficulty,
-            "created_at": recipe.created_at,
-            "ingredients": ingredients_data,
-            "tags": tags_data,
-            "steps": steps_data,
-            "images": images_data
+            "id": recipe.id, "recipe_name": recipe.recipe_name, "description": recipe.recipe_description,
+            "cuisine": recipe.cuisine, "prep_time": recipe.prep_time, "cook_time": recipe.cook_time,
+            "total_time": recipe.prep_time + recipe.cook_time, "servings": recipe.servings,
+            "difficulty": recipe.difficulty, "created_at": recipe.created_at,
+            "ingredients": [{"ingredient_name": ri.ingredient.ingredient_name, "amount": ri.ingredient_quantity, "measurement_unit": ri.measurement.measurement_name if ri.measurement else None} for ri in recipe.recipe_ingredient],
+            "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
+            "tags": [tag.tag_name for tag in recipe.tags],
+            "images": [img.image_url for img in recipe.image],
+            "is_favorited": recipe.id in user_favorites
         })
-
     return jsonify(recipe_list)
 
 
 
-## CREATE RECIPES ##
-
 @app.route('/api/recipes', methods=['POST'])
 def create_recipe():
-    data = request.get_json()  # Get JSON data from request
-
-    # Debugging
-    print("🔹 Received Recipe Data:", data)
-
-    if not data:
-        return jsonify({"error": "No data received"}), 400
-
-    if "user_id" not in data:
-        return jsonify({"error": "Missing user_id"}), 400
-
-    # Validate required fields
-    required_fields = ['user_id', 'recipe_name', 'description', 'cuisine', 'prep_time', 'cook_time', 'servings', 'difficulty', 'ingredients', 'steps', 'images']
-    for field in required_fields:
-        if field not in data:
-            return jsonify({"error": f"Missing field: {field}"}), 400
+    data = request.get_json()
+    if not data or "user_id" not in data:
+        return jsonify({"error": "Missing required data"}), 400
 
     try:
-        # Step 1: Create the Recipe
         new_recipe = Recipe(
             user_id=data['user_id'],
             recipe_name=data['recipe_name'],
@@ -362,32 +312,26 @@ def create_recipe():
             difficulty=data['difficulty']
         )
         db.session.add(new_recipe)
-        db.session.flush()  # Allows us to access `new_recipe.id` before commit
+        db.session.flush()
 
-        # Step 2: Add Ingredients and Measurements
-        for ingredient in data['ingredients']:
+        for ingredient in data.get('ingredients', []):
             ingredient_name = ingredient.get('ingredient_name')
-            measurement_name = ingredient.get('measurement_name')  # Fixed to match the database column name
+            measurement_name = ingredient.get('measurement_name')
             quantity = ingredient.get('amount')
-
-            if not ingredient_name or not quantity:
-                return jsonify({"error": "Each ingredient must have a name and quantity"}), 400
-
-            # Check if the ingredient exists, if not, create it
+            if not ingredient_name or not quantity: continue
+            
             existing_ingredient = Ingredient.query.filter_by(ingredient_name=ingredient_name).first()
             if not existing_ingredient:
                 existing_ingredient = Ingredient(ingredient_name=ingredient_name)
                 db.session.add(existing_ingredient)
-                db.session.flush()  # Get the new ID before commit
+                db.session.flush()
 
-            # Check if the measurement exists, if not, create it
             existing_measurement = Measurement.query.filter_by(measurement_name=measurement_name).first()
             if not existing_measurement and measurement_name:
                 existing_measurement = Measurement(measurement_name=measurement_name)
                 db.session.add(existing_measurement)
-                db.session.flush()  # Get the new ID before commit
+                db.session.flush()
 
-            # Create RecipeIngredient entry
             recipe_ingredient = RecipeIngredient(
                 recipe_id=new_recipe.id,
                 ingredient_id=existing_ingredient.id,
@@ -396,206 +340,113 @@ def create_recipe():
             )
             db.session.add(recipe_ingredient)
 
-        # Step 3: Add Recipe Steps
-        for step in data['steps']:
-            step_number = step.get('step_number')
-            step_description = step.get('instruction')
-
-            if not step_number or not step_description:
-                return jsonify({"error": "Each step must have a step_number and instruction"}), 400
-
+        for step in data.get('steps', []):
             recipe_step = RecipeStep(
                 recipe_id=new_recipe.id,
-                step_number=step_number,
-                step_description=step_description
+                step_number=step.get('step_number'),
+                step_description=step.get('instruction')
             )
             db.session.add(recipe_step)
 
-        # Step 4: Add Recipe Images
-        for image_url in data['images']:
-            if not image_url:
-                return jsonify({"error": "Image URL cannot be empty"}), 400
+        for image_url in data.get('images', []):
+            if image_url:
+                recipe_image = Image(recipe_id=new_recipe.id, image_url=image_url)
+                db.session.add(recipe_image)
 
-            recipe_image = Image(
-                recipe_id=new_recipe.id,
-                image_url=image_url
-            )
-            db.session.add(recipe_image)
+        tag_names = data.get('tags', [])
+        for tag_name_str in tag_names:
+            if tag_name_str:
+                tag = Tag.query.filter_by(tag_name=tag_name_str).first()
+                if not tag:
+                    tag = Tag(tag_name=tag_name_str)
+                    db.session.add(tag)
+                new_recipe.tags.append(tag)
 
-        db.session.commit()  # Single commit at the end to ensure transaction safety
-
-        # Return response
-        return jsonify({
-            "id": new_recipe.id,
-            "recipe_name": new_recipe.recipe_name,
-            "description": new_recipe.recipe_description,
-            "cuisine": new_recipe.cuisine,
-            "prep_time": new_recipe.prep_time,
-            "cook_time": new_recipe.cook_time,
-            "servings": new_recipe.servings,
-            "difficulty": new_recipe.difficulty,
-            "created_at": new_recipe.created_at,
-            "ingredients": [
-                {
-                    "ingredient_name": ingredient["ingredient_name"],
-                    "amount": ingredient["amount"],
-                    "measurement_unit": ingredient.get("measurement_name", "N/A")  # Ensure key matches the request data
-                } for ingredient in data["ingredients"]
-            ],
-            "steps": [
-                {
-                    "step_number": step["step_number"],
-                    "instruction": step["instruction"]
-                } for step in data["steps"]
-            ],
-            "images": [
-                {"image_url": image_url} for image_url in data["images"]
-            ]
-        }), 201  # 201 means "Created Successfully"
+        db.session.commit()
+        return jsonify({ "id": new_recipe.id, "message": "Recipe created successfully" }), 201
 
     except Exception as e:
-        db.session.rollback()  # Rollback in case of any errors
-        print(" Database Error:", str(e))  # Debugging
-        return jsonify({"error": str(e)}), 500  # Return server error if something goes wrong
+        db.session.rollback()
+        print("Database Error:", str(e))
+        return jsonify({"error": "An internal error occurred"}), 500
 
-
-## UPDATE RECIPE ##
 
 @app.route('/api/recipes/<int:recipe_id>', methods=['PUT'])
 @jwt_required()
 def update_recipe(recipe_id):
-    current_user = get_jwt_identity()
+    current_user_id = get_jwt_identity()
     data = request.get_json()
 
     recipe_entry = Recipe.query.get(recipe_id)
     if not recipe_entry:
         return jsonify({"error": "Recipe not found"}), 404
 
-    user = User.query.get(current_user)
+    user = User.query.get(current_user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    if user.role != 'admin' and str(recipe_entry.user_id) != str(current_user):
+    if user.role != 'admin' and str(recipe_entry.user_id) != str(current_user_id):
         return jsonify({"error": "Unauthorized to edit this recipe"}), 403
 
     try:
-        # Update Basic Recipe Information
         recipe_entry.recipe_name = data.get('recipe_name', recipe_entry.recipe_name)
-        recipe_entry.recipe_description = data.get('recipe_description', recipe_entry.recipe_description)
+        recipe_entry.recipe_description = data.get('description', recipe_entry.recipe_description)
         recipe_entry.cuisine = data.get('cuisine', recipe_entry.cuisine)
         recipe_entry.prep_time = data.get('prep_time', recipe_entry.prep_time)
         recipe_entry.cook_time = data.get('cook_time', recipe_entry.cook_time)
         recipe_entry.servings = data.get('servings', recipe_entry.servings)
         recipe_entry.difficulty = data.get('difficulty', recipe_entry.difficulty)
 
-        # Ingredients
         if 'ingredients' in data:
-            incoming_ingredients = []
-            for ing in data['ingredients']:
-                name = ing.get('ingredient_name')
-                quantity = ing.get('amount')
-                measurement_name = ing.get('measurement_name')
-
-                if not name or not quantity:
-                    return jsonify({"error": "Each ingredient must have a name and quantity"}), 400
-
-                ingredient_obj = Ingredient.query.filter_by(ingredient_name=name).first()
-                if not ingredient_obj:
-                    ingredient_obj = Ingredient(ingredient_name=name)
-                    db.session.add(ingredient_obj)
-                    db.session.flush()
-
-                measurement_obj = None
-                if measurement_name:
-                    measurement_obj = Measurement.query.filter_by(measurement_name=measurement_name).first()
-                    if not measurement_obj:
-                        measurement_obj = Measurement(measurement_name=measurement_name)
-                        db.session.add(measurement_obj)
-                        db.session.flush()
-
-                incoming_ingredients.append({
-                    "ingredient_id": ingredient_obj.id,
-                    "measurement_id": measurement_obj.id if measurement_obj else None,
-                    "quantity": quantity
-                })
-
             RecipeIngredient.query.filter_by(recipe_id=recipe_id).delete()
-            for ing in incoming_ingredients:
-                db.session.add(RecipeIngredient(
-                    recipe_id=recipe_id,
-                    ingredient_id=ing["ingredient_id"],
-                    measurement_id=ing["measurement_id"],
-                    ingredient_quantity=ing["quantity"]
-                ))
+            for ing_data in data.get('ingredients', []):
+                ing_name = ing_data.get('ingredient_name')
+                if not ing_name: continue
+                ing_obj = Ingredient.query.filter_by(ingredient_name=ing_name).first()
+                if not ing_obj:
+                    ing_obj = Ingredient(ingredient_name=ing_name)
+                    db.session.add(ing_obj)
+                    db.session.flush()
+                meas_obj = None
+                meas_name = ing_data.get('measurement_name')
+                if meas_name:
+                    meas_obj = Measurement.query.filter_by(measurement_name=meas_name).first()
+                    if not meas_obj:
+                        meas_obj = Measurement(measurement_name=meas_name)
+                        db.session.add(meas_obj)
+                        db.session.flush()
+                new_recipe_ing = RecipeIngredient(recipe_id=recipe_id, ingredient_id=ing_obj.id, measurement_id=meas_obj.id if meas_obj else None, ingredient_quantity=ing_data.get('amount'))
+                db.session.add(new_recipe_ing)
 
-        # Steps
         if 'steps' in data:
-            incoming_steps = {step['step_number']: step['instruction'] for step in data['steps']}
-            existing_steps = {s.step_number: s for s in RecipeStep.query.filter_by(recipe_id=recipe_id).all()}
+            RecipeStep.query.filter_by(recipe_id=recipe_id).delete()
+            for step_data in data.get('steps', []):
+                db.session.add(RecipeStep(recipe_id=recipe_id, step_number=step_data.get('step_number'), step_description=step_data.get('instruction')))
 
-            for step_number, instruction in incoming_steps.items():
-                if step_number in existing_steps:
-                    existing_steps[step_number].step_description = instruction
-                else:
-                    db.session.add(RecipeStep(
-                        recipe_id=recipe_id,
-                        step_number=step_number,
-                        step_description=instruction
-                    ))
-
-            to_delete = set(existing_steps.keys()) - set(incoming_steps.keys())
-            if to_delete:
-                RecipeStep.query.filter(
-                    RecipeStep.recipe_id == recipe_id,
-                    RecipeStep.step_number.in_(to_delete)
-                ).delete(synchronize_session=False)
-
-        # Images
         if 'images' in data:
-            incoming_images = set(data['images'])
-            existing_images = {img.image_url for img in Image.query.filter_by(recipe_id=recipe_id).all()}
-
-            for img_url in incoming_images - existing_images:
-                db.session.add(Image(recipe_id=recipe_id, image_url=img_url))
-
-            for img_url in existing_images - incoming_images:
-                Image.query.filter_by(recipe_id=recipe_id, image_url=img_url).delete()
+            Image.query.filter_by(recipe_id=recipe_id).delete()
+            for img_url in data.get('images', []):
+                if img_url and img_url.strip():
+                    db.session.add(Image(recipe_id=recipe_id, image_url=img_url))
+        
+        if 'tags' in data:
+            recipe_entry.tags.clear()
+            tag_names = data.get('tags', [])
+            for tag_name_str in tag_names:
+                if tag_name_str and tag_name_str.strip():
+                    tag = Tag.query.filter_by(tag_name=tag_name_str.strip()).first()
+                    if not tag:
+                        tag = Tag(tag_name=tag_name_str.strip())
+                        db.session.add(tag)
+                    recipe_entry.tags.append(tag)
 
         db.session.commit()
-
-        return jsonify({
-            "id": recipe_entry.id,
-            "recipe_name": recipe_entry.recipe_name,
-            "description": recipe_entry.recipe_description,
-            "cuisine": recipe_entry.cuisine,
-            "prep_time": recipe_entry.prep_time,
-            "cook_time": recipe_entry.cook_time,
-            "servings": recipe_entry.servings,
-            "difficulty": recipe_entry.difficulty,
-            "updated_at": recipe_entry.updated_at,
-            "ingredients": [
-                {
-                    "ingredient_name": ri.ingredient.ingredient_name,
-                    "amount": ri.ingredient_quantity,
-                    "measurement_name": ri.measurement.measurement_name if ri.measurement else "N/A"
-                } for ri in recipe_entry.recipe_ingredient
-            ],
-            "steps": [
-                {
-                    "step_number": step.step_number,
-                    "instruction": step.step_description
-                } for step in recipe_entry.recipe_step
-            ],
-            "images": [
-                {"image_url": image.image_url} for image in recipe_entry.image
-            ]
-        }), 200
+        return jsonify({"message": "Recipe updated successfully"}), 200
 
     except Exception as e:
         db.session.rollback()
+        print(f"Update Error: {e}")
         return jsonify({"error": str(e)}), 500
-
-
 
 ## DELETE RECIPE ##
 
@@ -694,6 +545,14 @@ def get_recipe(recipe_id):
         "steps": steps_data,
         "images": images_data
     })
+
+## TAGS ##
+
+@app.route('/api/tags', methods=['GET'])
+def get_tags():
+    tags = Tag.query.all()
+    tag_list = [tag.tag_name for tag in tags]
+    return jsonify(tag_list)
 
 
 ## GET USER ##
@@ -913,6 +772,66 @@ def delete_user(user_id):
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+
+## USER FAVORITES ##
+
+@app.route('/api/users/favorites/<int:recipe_id>', methods=['POST'])
+@jwt_required()
+def add_favorite(recipe_id):
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    recipe = Recipe.query.get(recipe_id)
+    if not user or not recipe:
+        return jsonify({"error": "User or Recipe not found"}), 404
+
+    user.favorite_recipes.append(recipe)
+    db.session.commit()
+    return jsonify({"message": "Recipe added to favorites"}), 200
+
+@app.route('/api/users/favorites/<int:recipe_id>', methods=['DELETE'])
+@jwt_required()
+def remove_favorite(recipe_id):
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    recipe = Recipe.query.get(recipe_id)
+    if not user or not recipe:
+        return jsonify({"error": "User or Recipe not found"}), 404
+
+    if recipe in user.favorite_recipes:
+        user.favorite_recipes.remove(recipe)
+        db.session.commit()
+    return jsonify({"message": "Recipe removed from favorites"}), 200
+
+@app.route('/api/users/favorites', methods=['GET'])
+@jwt_required()
+def get_favorites():
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    favorite_list = []
+    # Loop through the user's favorite recipes
+    for recipe in user.favorite_recipes:
+        # Construct the full recipe object, similar to get_recipes
+        favorite_list.append({
+            "id": recipe.id,
+            "recipe_name": recipe.recipe_name,
+            "description": recipe.recipe_description,
+            "cuisine": recipe.cuisine,
+            "prep_time": recipe.prep_time,
+            "cook_time": recipe.cook_time,
+            "servings": recipe.servings,
+            "difficulty": recipe.difficulty,
+            "created_at": recipe.created_at,
+            "user_id": recipe.user_id, # Needed for edit/delete check
+            "ingredients": [{"ingredient_name": ri.ingredient.ingredient_name, "amount": ri.ingredient_quantity, "measurement_unit": ri.measurement.measurement_name if ri.measurement else None} for ri in recipe.recipe_ingredient],
+            "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
+            "tags": [tag.tag_name for tag in recipe.tags],
+            "images": [img.image_url for img in recipe.image],
+            "is_favorited": True # Since these are favorites, this is always true
+        })
+    return jsonify(favorite_list)
 
 
 

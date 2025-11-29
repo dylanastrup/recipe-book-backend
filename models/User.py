@@ -1,5 +1,6 @@
 from datetime import datetime
 from models import db 
+from models import user_favorites
 from werkzeug.security import generate_password_hash, check_password_hash
 
 class User(db.Model):
@@ -15,6 +16,7 @@ class User(db.Model):
     
     # Relationships
     recipe = db.relationship('Recipe', back_populates='user', cascade="all, delete-orphan")
+    favorite_recipes = db.relationship('Recipe', secondary=user_favorites, backref='favorited_by')
 
     # Hash password before storing
     def set_password(self, password):
