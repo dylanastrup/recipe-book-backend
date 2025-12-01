@@ -6,7 +6,8 @@ import traceback
 import inflect
 
 # Database and models
-from models import db, User, Recipe, RecipeIngredient, RecipeStep, Image, Tag, Measurement, recipe_tags, user_favorites
+# ADDED 'Ingredient' back to this list
+from models import db, User, Recipe, Ingredient, Measurement, RecipeIngredient, RecipeStep, Image, Tag, recipe_tags, user_favorites
 from flask_migrate import Migrate
 
 # Extensions
@@ -153,7 +154,7 @@ def register():
     if User.query.filter_by(email=data['email']).first() or User.query.filter_by(username=data['username']).first():
         return jsonify({"error": "User already exists"}), 400
 
-    new_user = User(username=username, email=email)
+    new_user = User(username=data['username'], email=data['email'])
     new_user.set_password(password)
 
     db.session.add(new_user)
@@ -185,7 +186,6 @@ def login():
 def forgot_password():
     data = request.get_json()
     email = data.get('email')
-
     user = User.query.filter_by(email=email).first()
     if not user:
         return jsonify({"error": "No account with this email"}), 400
@@ -759,7 +759,6 @@ def delete_user(user_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True)
