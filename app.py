@@ -17,7 +17,19 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
 from sqlalchemy import String, cast, or_
+from recipe_scrapers import scrape_me
+import google.generativeai as genai
+from werkzeug.utils import secure_filename
+import tempfile
+from google.api_core.exceptions import ResourceExhausted
 
+gemini_key = os.environ.get("GEMINI_API_KEY")
+
+if gemini_key:
+    genai.configure(api_key=gemini_key)
+else:
+    # Optional: Print a warning if running locally without a key
+    print("Warning: GEMINI_API_KEY not found. AI features will not work.")
 
 app = Flask(__name__)
 p = inflect.engine() # Initialize the singularization engine
@@ -154,8 +166,13 @@ def register():
     if User.query.filter_by(email=data['email']).first() or User.query.filter_by(username=data['username']).first():
         return jsonify({"error": "User already exists"}), 400
 
-    new_user = User(username=data['username'], email=data['email'])
-    new_user.set_password(password)
+    new_user = User(
+        username=data['username'], 
+        email=data['email'],
+        first_name=data.get('first_name'),
+        last_name=data.get('last_name')
+    )
+    new_user.set_password(data['password'])
 
     db.session.add(new_user)
     db.session.commit()
@@ -618,8 +635,10 @@ def get_favorites():
 def get_user(user_id):
     current_user_id = get_jwt_identity()
     claims = get_jwt()
+    # Allow admins to view anyone, or users to view themselves
     if claims.get("role") != 'admin' and str(current_user_id) != str(user_id):
         return jsonify({"error": "Unauthorized"}), 403
+    
     user = User.query.get(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
@@ -627,7 +646,9 @@ def get_user(user_id):
     return jsonify({
         "id": user.id,
         "username": user.username,
-        "email": user.email
+        "email": user.email,
+        "first_name": user.first_name,
+        "last_name": user.last_name
     })
 
 ## GET USERS RECIPES ##
@@ -658,14 +679,24 @@ def get_user_recipes(user_id):
 def update_profile():
     current_user_id = get_jwt_identity()
     user = User.query.get(current_user_id)
+
     if not user:
         return jsonify({"error": "User not found"}), 404
 
     data = request.get_json()
     print("🔹 Received Data:", data)
 
+    # --- NEW: Update First and Last Name ---
+    # We don't need unique validation for names, so we just update if present
+    if "first_name" in data:
+        user.first_name = data["first_name"]
+    
+    if "last_name" in data:
+        user.last_name = data["last_name"]
+    # ---------------------------------------
+
     # Validate and Update Username
-     # Check for duplicate username (only if username is changing)
+    # Check for duplicate username (only if username is changing)
     if "username" in data and data["username"] and data["username"] != user.username:
         existing_user = User.query.filter_by(username=data["username"]).first()
         if existing_user:
@@ -703,7 +734,6 @@ def update_profile():
         db.session.rollback()
         print("Update Error:", str(e))
         return jsonify({"error": str(e)}), 500
-
     
 ## ADMIN ROUTES ##
 
@@ -759,6 +789,186 @@ def delete_user(user_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+    
+# --- Recipe Scraper Route ---
+
+def parse_ingredient_string(text):
+    """
+    Simple heuristic to split '1 cup flour' into amount, unit, name.
+    This is not perfect but works for standard formats.
+    """
+    text = text.strip()
+    
+    # Regex to find a number at the start (integers, decimals, or fractions like 1/2)
+    # Matches: "1", "1.5", "1/2", "1-1/2"
+    match = re.match(r'^([\d\s/\.\-]+?)\s+(.*)', text)
+    
+    if not match:
+        # No number found? Return whole text as name
+        return {"amount": "", "measurement_name": "", "ingredient_name": text}
+    
+    amount = match.group(1).strip()
+    rest = match.group(2).strip()
+    
+    # Try to find the unit in the "rest" of the string
+    # We check against the UNIT_MAPPINGS keys we defined earlier
+    found_unit = ""
+    ingredient_part = rest
+    
+    # Sort units by length (longest first) to match "tablespoon" before "tsp"
+    all_units = sorted(UNIT_MAPPINGS.keys(), key=len, reverse=True)
+    
+    for unit in all_units:
+        # Check if the string starts with this unit (e.g., "cup flour")
+        # We look for "unit " (with a space) to avoid matching "gram" inside "graham crackers"
+        if rest.lower().startswith(unit):
+            found_unit = UNIT_MAPPINGS[unit] # Normalize it immediately!
+            # Remove unit from the start of the string
+            ingredient_part = rest[len(unit):].strip()
+            # Remove optional "of" (e.g., "cup of flour")
+            if ingredient_part.lower().startswith("of "):
+                ingredient_part = ingredient_part[3:].strip()
+            break
+            
+    return {
+        "amount": amount,
+        "measurement_name": found_unit,
+        "ingredient_name": ingredient_part
+    }
+
+@app.route('/api/import-recipe', methods=['POST'])
+@jwt_required()
+def import_recipe_url():
+    data = request.get_json()
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+        
+    try:
+        scraper = scrape_me(url)
+        
+        # Extract basic info
+        title = scraper.title()
+        yields = scraper.yields()
+        
+        # Time logic (scraper returns total minutes usually)
+        total_minutes = scraper.total_time() or 0
+        prep_time = 15 # Default/Guess if missing
+        cook_time = max(0, total_minutes - prep_time)
+        
+        # Parse Ingredients
+        raw_ingredients = scraper.ingredients()
+        parsed_ingredients = [parse_ingredient_string(ing) for ing in raw_ingredients]
+        
+        # Parse Steps
+        raw_instructions = scraper.instructions_list() 
+        # If instructions_list() returns nothing, try instructions() and split by newline
+        if not raw_instructions:
+            raw_instructions = scraper.instructions().split('\n')
+            
+        steps = []
+        step_counter = 1
+        for step_text in raw_instructions:
+            if step_text.strip():
+                steps.append({
+                    "id": step_counter, # Temp ID for frontend
+                    "step_number": step_counter,
+                    "instruction": step_text.strip()
+                })
+                step_counter += 1
+
+        return jsonify({
+            "recipe_name": title,
+            "description": f"Imported from {scraper.host()}",
+            "cuisine": "", # Scrapers often struggle with this, leave blank
+            "prep_time": prep_time,
+            "cook_time": cook_time,
+            "servings": yields.replace(" servings", "") if yields else "4",
+            "difficulty": "Medium",
+            "ingredients": parsed_ingredients,
+            "steps": steps,
+            "images": [scraper.image()] if scraper.image() else [""],
+            "tags": []
+        })
+
+    except Exception as e:
+        print(f"Scraper Error: {e}")
+        return jsonify({"error": "Could not import recipe. This website might not be supported."}), 400
+    
+@app.route('/api/analyze-recipe-image', methods=['POST'])
+@jwt_required()
+def analyze_recipe_image():
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+        
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    try:
+        from werkzeug.utils import secure_filename
+        filename = secure_filename(file.filename)
+        _, file_extension = os.path.splitext(filename)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp:
+            file.save(temp.name)
+            temp_path = temp.name
+
+        # Use the model we know works for your key
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        
+        uploaded_file = genai.upload_file(path=temp_path, mime_type=file.mimetype)
+        
+        prompt = """
+        Analyze this recipe input. It might be an image of food, a handwritten recipe card, or a PDF document.
+        Extract the data into this exact JSON format:
+        {
+            "recipe_name": "Title of recipe",
+            "description": "A short description",
+            "prep_time": 0,
+            "cook_time": 0,
+            "servings": 0,
+            "ingredients": [
+                {"amount": "1", "measurement_name": "cup", "ingredient_name": "flour"},
+                ...
+            ],
+            "steps": [
+                {"step_number": 1, "instruction": "Mix ingredients..."},
+                ...
+            ]
+        }
+        If a field is missing, estimate it or leave it blank/0.
+        Return ONLY valid JSON. Do not use markdown formatting.
+        """
+
+        response = model.generate_content([prompt, uploaded_file])
+        
+        os.remove(temp_path)
+        
+        json_str = response.text.replace("```json", "").replace("```", "").strip()
+        import json
+        recipe_data = json.loads(json_str)
+        
+        recipe_data['difficulty'] = "Medium"
+        recipe_data['images'] = [] 
+        recipe_data['tags'] = []
+
+        return jsonify(recipe_data)
+
+    # --- NEW: Catch the specific Rate Limit Error ---
+    except ResourceExhausted:
+        # Return 429 status code (Too Many Requests)
+        return jsonify({"error": "AI usage limit reached. Please wait 60 seconds and try again."}), 429
+    # ------------------------------------------------
+
+    except Exception as e:
+        print(f"AI Error: {e}")
+        try:
+            if 'temp_path' in locals(): os.remove(temp_path)
+        except:
+            pass
+        return jsonify({"error": "Failed to analyze image. Please try again."}), 500
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True)
