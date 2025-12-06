@@ -4,10 +4,17 @@ from datetime import datetime
 import re
 import traceback
 import inflect
+import json
+import tempfile
+
+# AI and Scraping Imports
+from recipe_scrapers import scrape_me
+import google.generativeai as genai
+from werkzeug.utils import secure_filename
+from google.api_core.exceptions import ResourceExhausted
 
 # Database and models
-# ADDED 'Ingredient' back to this list
-from models import db, User, Recipe, Ingredient, Measurement, RecipeIngredient, RecipeStep, Image, Tag, recipe_tags, user_favorites
+from models import db, User, Recipe, RecipeIngredient, RecipeStep, Image, Tag, Measurement, recipe_tags, user_favorites, Ingredient, Rating
 from flask_migrate import Migrate
 
 # Extensions
@@ -17,18 +24,12 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
 from sqlalchemy import String, cast, or_
-from recipe_scrapers import scrape_me
-import google.generativeai as genai
-from werkzeug.utils import secure_filename
-import tempfile
-from google.api_core.exceptions import ResourceExhausted
 
+# Configure Gemini API securely
 gemini_key = os.environ.get("GEMINI_API_KEY")
-
 if gemini_key:
     genai.configure(api_key=gemini_key)
 else:
-    # Optional: Print a warning if running locally without a key
     print("Warning: GEMINI_API_KEY not found. AI features will not work.")
 
 app = Flask(__name__)
@@ -66,9 +67,9 @@ jwt = JWTManager(app)
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'dylanastrup@gmail.com'  
-app.config['MAIL_PASSWORD'] = 'bcob qkhm qwvs ttym' 
-app.config['MAIL_DEFAULT_SENDER'] = 'dylanastrup@gmail.com' 
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_SENDER') or os.environ.get('MAIL_USERNAME')
 
 mail = Mail(app)
 serializer = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'])
@@ -105,13 +106,8 @@ def normalize_measurement(unit_name):
 def normalize_ingredient(name):
     if not name:
         return None
-    # 1. Lowercase and strip whitespace
     clean = name.lower().strip()
-    
-    # 2. Singularize (e.g., "carrots" -> "carrot")
-    # p.singular_noun returns False if the word is already singular
     singular = p.singular_noun(clean)
-    
     if singular:
         return singular
     return clean
@@ -172,7 +168,7 @@ def register():
         first_name=data.get('first_name'),
         last_name=data.get('last_name')
     )
-    new_user.set_password(data['password'])
+    new_user.set_password(password)
 
     db.session.add(new_user)
     db.session.commit()
@@ -193,6 +189,9 @@ def login():
     user = User.query.filter_by(username=data['username']).first()
 
     if user and check_password_hash(user.password_hash, data['password']):
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        
         access_token = create_access_token(identity=str(user.id), additional_claims={"role": user.role}, fresh=True)
         refresh_token = create_refresh_token(identity=str(user.id), additional_claims={"role": user.role})
         return jsonify(access_token=access_token, refresh_token=refresh_token), 200
@@ -270,6 +269,11 @@ def get_recipes():
     search = request.args.get('search', '').lower()
     sort_by = request.args.get('sort', '')
     
+    # --- PAGINATION PARAMETERS ---
+    page = request.args.get('page', 1, type=int)
+    per_page = 12 
+    # -----------------------------
+
     query = Recipe.query
 
     if search:
@@ -281,6 +285,14 @@ def get_recipes():
                 Tag.tag_name.ilike(f"%{search}%")
             )
         ).distinct()
+
+    # Filter by Tags (from URL)
+    tags_param = request.args.get('tags', '')
+    if tags_param:
+        tag_list = tags_param.split(',')
+        for tag in tag_list:
+            if tag.strip():
+                query = query.filter(Recipe.tags.any(Tag.tag_name.ilike(tag.strip())))
 
     sort_options = {
         "recipe_name_asc": Recipe.recipe_name.asc(), "recipe_name_desc": Recipe.recipe_name.desc(),
@@ -294,9 +306,17 @@ def get_recipes():
     else:
         query = query.order_by(Recipe.created_at.desc())
         
-    recipes = query.all()
+    # --- EXECUTE PAGINATION ---
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    recipes = pagination.items
+    # --------------------------
+    
     recipe_list = []
     for recipe in recipes:
+        # CALCULATE RATING
+        ratings = [r.score for r in recipe.ratings]
+        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+
         recipe_list.append({
             "id": recipe.id,
             "recipe_name": recipe.recipe_name,
@@ -312,9 +332,18 @@ def get_recipes():
             "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
             "tags": [tag.tag_name for tag in recipe.tags],
             "images": [img.image_url for img in recipe.image],
-            "is_favorited": recipe.id in user_favorites
+            "is_favorited": recipe.id in user_favorites,
+            "rating": avg_rating,
+            "rating_count": len(ratings),
+            "original_recipe_id": recipe.original_recipe_id # Include parent ID for UI logic
         })
-    return jsonify(recipe_list)
+
+    return jsonify({
+        "recipes": recipe_list,
+        "total_pages": pagination.pages,
+        "current_page": page,
+        "total_items": pagination.total
+    })
 
 
 @app.route('/api/recipes', methods=['POST'])
@@ -497,6 +526,10 @@ def delete_recipe(recipe_id):
         RecipeStep.query.filter_by(recipe_id=recipe_id).delete()
         Image.query.filter_by(recipe_id=recipe_id).delete()
         recipe_entry.tags.clear()
+        
+        # Delete ratings
+        Rating.query.filter_by(recipe_id=recipe_id).delete()
+
         db.session.delete(recipe_entry)
         db.session.commit()
         return jsonify({"message": f"Recipe {recipe_id} deleted successfully"}), 200
@@ -510,15 +543,14 @@ def delete_recipe(recipe_id):
 @app.route('/api/recipes/<int:recipe_id>', methods=['GET'])
 @jwt_required()
 def get_recipe(recipe_id):
-    recipe_entry = Recipe.query.get(recipe_id)  # Fetch recipe by ID
-
+    recipe_entry = Recipe.query.get(recipe_id)
     if not recipe_entry:
         return jsonify({"error": "Recipe not found"}), 404
     
     user = User.query.get(recipe_entry.user_id) if recipe_entry.user_id else None
     username = user.username if user else None
 
-    # Fetch ingredients with measurements
+    # Fetch ingredients
     ingredients_data = []
     for recipe_ingredient in recipe_entry.recipe_ingredient:
         ingredient = recipe_ingredient.ingredient
@@ -530,16 +562,14 @@ def get_recipe(recipe_id):
             "measurement_unit": measurement.measurement_name if measurement else None
         })
 
-    # Fetch recipe steps
+    # Fetch steps
     steps_data = [
         {"step_number": step.step_number, "instruction": step.step_description}
         for step in recipe_entry.recipe_step
     ]
 
-    # Fetch related tags
+    # Fetch tags & images
     tags_data = [tag.tag_name for tag in recipe_entry.tags]
-
-    # Fetch recipe images
     images_data = [image.image_url for image in recipe_entry.image]
 
     current_user_id = get_jwt_identity()
@@ -547,8 +577,36 @@ def get_recipe(recipe_id):
     is_favorited = False
     if current_user and recipe_entry in current_user.favorite_recipes:
         is_favorited = True
+        
+    # Ratings
+    ratings = [r.score for r in recipe_entry.ratings]
+    avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+    
+    user_rating = 0
+    if current_user:
+        existing_rating = Rating.query.filter_by(user_id=current_user.id, recipe_id=recipe_id).first()
+        if existing_rating: user_rating = existing_rating.score
 
-    # Construct response
+    # Parent Info
+    original_info = None
+    if recipe_entry.original_recipe:
+        original_info = {
+            "id": recipe_entry.original_recipe.id,
+            "name": recipe_entry.original_recipe.recipe_name,
+            "username": recipe_entry.original_recipe.user.username if recipe_entry.original_recipe.user else "Unknown"
+        }
+
+    # --- NEW: Get Child "Remix" Info ---
+    # This grabs any recipe that points to THIS recipe as its original
+    remixes_list = []
+    for remix in recipe_entry.remixes:
+        remixes_list.append({
+            "id": remix.id,
+            "name": remix.recipe_name,
+            "username": remix.user.username if remix.user else "Unknown"
+        })
+    # -----------------------------------
+
     return jsonify({
         "id": recipe_entry.id,
         "recipe_name": recipe_entry.recipe_name,
@@ -562,11 +620,102 @@ def get_recipe(recipe_id):
         "username": username,
         "created_at": recipe_entry.created_at,
         "ingredients": ingredients_data,
-        "tags": tags_data,
         "steps": steps_data,
+        "tags": tags_data,
         "images": images_data,
-        "is_favorited": is_favorited
+        "is_favorited": is_favorited,
+        "rating": avg_rating,
+        "rating_count": len(ratings),
+        "user_rating": user_rating,
+        "original_recipe": original_info,
+        "remixes": remixes_list # <-- Sending the list to frontend
     })
+
+## SPICE IT UP (FORK) ROUTE ##
+@app.route('/api/recipes/<int:recipe_id>/spice', methods=['POST'])
+@jwt_required()
+def spice_recipe(recipe_id):
+    current_user_id = get_jwt_identity()
+    original = Recipe.query.get(recipe_id)
+    
+    if not original:
+        return jsonify({"error": "Recipe not found"}), 404
+
+    try:
+        # 1. Create Copy of Basic Info
+        new_recipe = Recipe(
+            user_id=current_user_id,
+            original_recipe_id=original.id, # Link to parent
+            recipe_name=f"Spiced Up: {original.recipe_name}",
+            recipe_description=original.recipe_description,
+            cuisine=original.cuisine,
+            prep_time=original.prep_time,
+            cook_time=original.cook_time,
+            servings=original.servings,
+            difficulty=original.difficulty
+        )
+        db.session.add(new_recipe)
+        db.session.flush() # Get ID
+
+        # 2. Copy Ingredients
+        for ri in original.recipe_ingredient:
+            new_ri = RecipeIngredient(
+                recipe_id=new_recipe.id,
+                ingredient_id=ri.ingredient_id,
+                measurement_id=ri.measurement_id,
+                ingredient_quantity=ri.ingredient_quantity
+            )
+            db.session.add(new_ri)
+
+        # 3. Copy Steps
+        for step in original.recipe_step:
+            new_step = RecipeStep(
+                recipe_id=new_recipe.id,
+                step_number=step.step_number,
+                step_description=step.step_description
+            )
+            db.session.add(new_step)
+
+        # 4. Copy Tags
+        for tag in original.tags:
+            new_recipe.tags.append(tag)
+
+        db.session.commit()
+        return jsonify({"message": "Recipe spiced up successfully", "new_recipe_id": new_recipe.id}), 201
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Spice Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+## RATINGS ROUTES ##
+
+@app.route('/api/recipes/<int:recipe_id>/rate', methods=['POST', 'OPTIONS'])
+@jwt_required()
+def rate_recipe(recipe_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    score = data.get('score')
+
+    if not score or not isinstance(score, int) or not (1 <= score <= 5):
+        return jsonify({"error": "Score must be an integer between 1 and 5"}), 400
+
+    # Check if user already rated this recipe
+    existing_rating = Rating.query.filter_by(user_id=current_user_id, recipe_id=recipe_id).first()
+
+    if existing_rating:
+        existing_rating.score = score
+        message = "Rating updated"
+    else:
+        new_rating = Rating(user_id=current_user_id, recipe_id=recipe_id, score=score)
+        db.session.add(new_rating)
+        message = "Rating added"
+
+    db.session.commit()
+    return jsonify({"message": message}), 200
 
 ## USER FAVORITES ##
 
@@ -608,7 +757,10 @@ def get_favorites():
     favorite_list = []
     # Loop through the user's favorite recipes
     for recipe in user.favorite_recipes:
-        # Construct the full recipe object, similar to get_recipes
+        # CALCULATE RATING FOR FAVORITES
+        ratings = [r.score for r in recipe.ratings]
+        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+
         favorite_list.append({
             "id": recipe.id,
             "recipe_name": recipe.recipe_name,
@@ -624,7 +776,9 @@ def get_favorites():
             "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
             "tags": [tag.tag_name for tag in recipe.tags],
             "images": [img.image_url for img in recipe.image],
-            "is_favorited": True # Since these are favorites, this is always true
+            "is_favorited": True,
+            "rating": avg_rating,
+            "rating_count": len(ratings)
         })
     return jsonify(favorite_list)
 
@@ -635,10 +789,8 @@ def get_favorites():
 def get_user(user_id):
     current_user_id = get_jwt_identity()
     claims = get_jwt()
-    # Allow admins to view anyone, or users to view themselves
     if claims.get("role") != 'admin' and str(current_user_id) != str(user_id):
         return jsonify({"error": "Unauthorized"}), 403
-    
     user = User.query.get(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
@@ -656,19 +808,40 @@ def get_user(user_id):
 @app.route('/api/users/<int:user_id>/recipes', methods=['GET'])
 @jwt_required()
 def get_user_recipes(user_id):
-    recipes = Recipe.query.filter_by(user_id=user_id).all()
-    recipe_list = [{
-        "id": recipe.id,
-        "recipe_name": recipe.recipe_name,
-        "description": recipe.recipe_description,
-        "cuisine": recipe.cuisine,
-        "prep_time": recipe.prep_time,
-        "cook_time": recipe.cook_time,
-        "servings": recipe.servings,
-        "difficulty": recipe.difficulty,
-        "created_at": recipe.created_at
-    } for recipe in recipes]
+    # Get current user to check favorites
+    current_user_id = get_jwt_identity()
+    current_user = User.query.get(current_user_id)
+    user_favorites = {recipe.id for recipe in current_user.favorite_recipes} if current_user else set()
 
+    # Fetch all recipes for this user, newest first
+    recipes = Recipe.query.filter_by(user_id=user_id).order_by(Recipe.created_at.desc()).all()
+    
+    recipe_list = []
+    for recipe in recipes:
+        # Calculate ratings
+        ratings = [r.score for r in recipe.ratings]
+        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+
+        recipe_list.append({
+            "id": recipe.id,
+            "recipe_name": recipe.recipe_name,
+            "description": recipe.recipe_description,
+            "cuisine": recipe.cuisine,
+            "prep_time": recipe.prep_time,
+            "cook_time": recipe.cook_time,
+            "servings": recipe.servings,
+            "difficulty": recipe.difficulty,
+            "created_at": recipe.created_at,
+            "user_id": recipe.user_id, # Crucial for Edit/Delete buttons
+            "ingredients": [{"ingredient_name": ri.ingredient.ingredient_name, "amount": ri.ingredient_quantity, "measurement_unit": ri.measurement.measurement_name if ri.measurement else None} for ri in recipe.recipe_ingredient],
+            "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
+            "tags": [tag.tag_name for tag in recipe.tags],
+            "images": [img.image_url for img in recipe.image],
+            "is_favorited": recipe.id in user_favorites,
+            "rating": avg_rating,
+            "rating_count": len(ratings),
+            "original_recipe_id": recipe.original_recipe_id
+        })
     return jsonify(recipe_list)
 
 
@@ -679,31 +852,24 @@ def get_user_recipes(user_id):
 def update_profile():
     current_user_id = get_jwt_identity()
     user = User.query.get(current_user_id)
-
     if not user:
         return jsonify({"error": "User not found"}), 404
 
     data = request.get_json()
     print("🔹 Received Data:", data)
 
-    # --- NEW: Update First and Last Name ---
-    # We don't need unique validation for names, so we just update if present
-    if "first_name" in data:
-        user.first_name = data["first_name"]
-    
-    if "last_name" in data:
-        user.last_name = data["last_name"]
-    # ---------------------------------------
+    # --- UPDATE FIRST AND LAST NAME ---
+    if "first_name" in data: user.first_name = data["first_name"]
+    if "last_name" in data: user.last_name = data["last_name"]
 
     # Validate and Update Username
-    # Check for duplicate username (only if username is changing)
     if "username" in data and data["username"] and data["username"] != user.username:
         existing_user = User.query.filter_by(username=data["username"]).first()
         if existing_user:
             return jsonify({"error": "Username already taken"}), 400
         user.username = data["username"]
 
-    # Check for duplicate email (only if email is changing)
+    # Check for duplicate email
     if "email" in data and data["email"] and data["email"] != user.email:
         existing_email = User.query.filter_by(email=data["email"]).first()
         if existing_email:
@@ -728,12 +894,12 @@ def update_profile():
 
     try:
         db.session.commit()
-        print("Profile Updated Successfully!")
         return jsonify({"message": "Profile updated successfully!"})
     except Exception as e:
         db.session.rollback()
         print("Update Error:", str(e))
         return jsonify({"error": str(e)}), 500
+
     
 ## ADMIN ROUTES ##
 
@@ -743,7 +909,15 @@ def get_all_users():
     claims = get_jwt()
     if claims.get("role") != "admin": return jsonify({"error": "Admin access only"}), 403
     users = User.query.all()
-    user_list = [{"id": user.id, "username": user.username, "email": user.email, "role": user.role, "created_at": user.created_at, "recipe_count": len(user.recipe)} for user in users]
+    user_list = [{
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "created_at": user.created_at,
+        "last_login": user.last_login, # Return last_login
+        "recipe_count": len(user.recipe)
+    } for user in users]
     return jsonify(user_list)
 
 @app.route('/api/admin/users/<int:user_id>/role', methods=['PATCH'])
@@ -789,8 +963,67 @@ def delete_user(user_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    
+
 # --- Recipe Scraper Route ---
+@app.route('/api/import-recipe', methods=['POST'])
+@jwt_required()
+def import_recipe_url():
+    data = request.get_json()
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+        
+    try:
+        scraper = scrape_me(url)
+        
+        # Extract basic info
+        title = scraper.title()
+        yields = scraper.yields()
+        
+        # Time logic (scraper returns total minutes usually)
+        total_minutes = scraper.total_time() or 0
+        prep_time = 15 # Default/Guess if missing
+        cook_time = max(0, total_minutes - prep_time)
+        
+        # Parse Ingredients
+        raw_ingredients = scraper.ingredients()
+        parsed_ingredients = [parse_ingredient_string(ing) for ing in raw_ingredients]
+        
+        # Parse Steps
+        raw_instructions = scraper.instructions_list() 
+        # If instructions_list() returns nothing, try instructions() and split by newline
+        if not raw_instructions:
+            raw_instructions = scraper.instructions().split('\n')
+            
+        steps = []
+        step_counter = 1
+        for step_text in raw_instructions:
+            if step_text.strip():
+                steps.append({
+                    "id": step_counter, # Temp ID for frontend
+                    "step_number": step_counter,
+                    "instruction": step_text.strip()
+                })
+                step_counter += 1
+
+        return jsonify({
+            "recipe_name": title,
+            "description": f"Original recipe: {url}",
+            "cuisine": "", # Scrapers often struggle with this, leave blank
+            "prep_time": prep_time,
+            "cook_time": cook_time,
+            "servings": yields.replace(" servings", "") if yields else "4",
+            "difficulty": "Medium",
+            "ingredients": parsed_ingredients,
+            "steps": steps,
+            "images": [scraper.image()] if scraper.image() else [""],
+            "tags": []
+        })
+
+    except Exception as e:
+        print(f"Scraper Error: {e}")
+        return jsonify({"error": "Could not import recipe. This website might not be supported."}), 400
 
 def parse_ingredient_string(text):
     """
@@ -836,66 +1069,6 @@ def parse_ingredient_string(text):
         "ingredient_name": ingredient_part
     }
 
-@app.route('/api/import-recipe', methods=['POST'])
-@jwt_required()
-def import_recipe_url():
-    data = request.get_json()
-    url = data.get('url')
-    
-    if not url:
-        return jsonify({"error": "Missing URL"}), 400
-        
-    try:
-        scraper = scrape_me(url)
-        
-        # Extract basic info
-        title = scraper.title()
-        yields = scraper.yields()
-        
-        # Time logic (scraper returns total minutes usually)
-        total_minutes = scraper.total_time() or 0
-        prep_time = 15 # Default/Guess if missing
-        cook_time = max(0, total_minutes - prep_time)
-        
-        # Parse Ingredients
-        raw_ingredients = scraper.ingredients()
-        parsed_ingredients = [parse_ingredient_string(ing) for ing in raw_ingredients]
-        
-        # Parse Steps
-        raw_instructions = scraper.instructions_list() 
-        # If instructions_list() returns nothing, try instructions() and split by newline
-        if not raw_instructions:
-            raw_instructions = scraper.instructions().split('\n')
-            
-        steps = []
-        step_counter = 1
-        for step_text in raw_instructions:
-            if step_text.strip():
-                steps.append({
-                    "id": step_counter, # Temp ID for frontend
-                    "step_number": step_counter,
-                    "instruction": step_text.strip()
-                })
-                step_counter += 1
-
-        return jsonify({
-            "recipe_name": title,
-            "description": f"Imported from {scraper.host()}",
-            "cuisine": "", # Scrapers often struggle with this, leave blank
-            "prep_time": prep_time,
-            "cook_time": cook_time,
-            "servings": yields.replace(" servings", "") if yields else "4",
-            "difficulty": "Medium",
-            "ingredients": parsed_ingredients,
-            "steps": steps,
-            "images": [scraper.image()] if scraper.image() else [""],
-            "tags": []
-        })
-
-    except Exception as e:
-        print(f"Scraper Error: {e}")
-        return jsonify({"error": "Could not import recipe. This website might not be supported."}), 400
-    
 @app.route('/api/analyze-recipe-image', methods=['POST'])
 @jwt_required()
 def analyze_recipe_image():
@@ -956,11 +1129,10 @@ def analyze_recipe_image():
 
         return jsonify(recipe_data)
 
-    # --- NEW: Catch the specific Rate Limit Error ---
+    # --- Catch the specific Rate Limit Error ---
     except ResourceExhausted:
         # Return 429 status code (Too Many Requests)
         return jsonify({"error": "AI usage limit reached. Please wait 60 seconds and try again."}), 429
-    # ------------------------------------------------
 
     except Exception as e:
         print(f"AI Error: {e}")
