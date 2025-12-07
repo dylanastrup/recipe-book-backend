@@ -1,11 +1,13 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import traceback
 import inflect
 import json
 import tempfile
+import io
+import csv
 
 # AI and Scraping Imports
 from recipe_scrapers import scrape_me
@@ -14,7 +16,7 @@ from werkzeug.utils import secure_filename
 from google.api_core.exceptions import ResourceExhausted
 
 # Database and models
-from models import db, User, Recipe, RecipeIngredient, RecipeStep, Image, Tag, Measurement, recipe_tags, user_favorites, Ingredient, Rating
+from models import db, User, Recipe, RecipeIngredient, RecipeStep, Image, Tag, Measurement, recipe_tags, user_favorites, Ingredient, Rating, Feedback, SiteSetting
 from flask_migrate import Migrate
 
 # Extensions
@@ -23,7 +25,8 @@ from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, creat
 from werkzeug.security import check_password_hash, generate_password_hash
 from flask_mail import Mail, Message
 from itsdangerous import URLSafeTimedSerializer
-from sqlalchemy import String, cast, or_
+from sqlalchemy import String, cast, or_, func, desc
+from collections import Counter
 
 # Configure Gemini API securely
 gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -38,7 +41,7 @@ p = inflect.engine() # Initialize the singularization engine
 CORS(app, 
      resources={r"/api/*": {
          "origins": ["http://localhost:3000", "https://recipes.dylanastrup.com"],
-         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
          "allow_headers": ["Content-Type", "Authorization"]
      }}, 
      supports_credentials=True
@@ -269,12 +272,21 @@ def get_recipes():
     search = request.args.get('search', '').lower()
     sort_by = request.args.get('sort', '')
     
-    # --- PAGINATION PARAMETERS ---
+    # --- DEBUG PRINT ---
+    featured_param = request.args.get('featured', 'false')
+    print(f"🔍 REQUEST: Featured Param = {featured_param}") # Check your terminal for this!
+    
+    featured_only = featured_param.lower() == 'true'
+
     page = request.args.get('page', 1, type=int)
     per_page = 12 
-    # -----------------------------
 
     query = Recipe.query
+
+    # 1. Apply Featured Filter
+    if featured_only:
+        print("✅ Filtering for Featured Recipes Only") # Debug print
+        query = query.filter_by(is_featured=True)
 
     if search:
         query = query.outerjoin(Recipe.tags).filter(
@@ -286,7 +298,6 @@ def get_recipes():
             )
         ).distinct()
 
-    # Filter by Tags (from URL)
     tags_param = request.args.get('tags', '')
     if tags_param:
         tag_list = tags_param.split(',')
@@ -301,19 +312,21 @@ def get_recipes():
         "difficulty_asc": Recipe.difficulty.asc(), "difficulty_desc": Recipe.difficulty.desc(),
         "servings_asc": Recipe.servings.asc(), "servings_desc": Recipe.servings.desc(),
     }
+    
     if sort_by in sort_options:
         query = query.order_by(sort_options[sort_by])
     else:
-        query = query.order_by(Recipe.created_at.desc())
+        # If featured, randomize slightly. If standard feed, newest first.
+        if featured_only:
+            query = query.order_by(func.random())
+        else:
+            query = query.order_by(Recipe.created_at.desc())
         
-    # --- EXECUTE PAGINATION ---
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
     recipes = pagination.items
-    # --------------------------
     
     recipe_list = []
     for recipe in recipes:
-        # CALCULATE RATING
         ratings = [r.score for r in recipe.ratings]
         avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
 
@@ -328,6 +341,8 @@ def get_recipes():
             "difficulty": recipe.difficulty,
             "created_at": recipe.created_at,
             "user_id": recipe.user_id,
+            "username": recipe.user.username if recipe.user else "Unknown",
+            "is_featured": recipe.is_featured, # This ensures the frontend knows its status
             "ingredients": [{"ingredient_name": ri.ingredient.ingredient_name, "amount": ri.ingredient_quantity, "measurement_unit": ri.measurement.measurement_name if ri.measurement else None} for ri in recipe.recipe_ingredient],
             "steps": [{"step_number": step.step_number, "instruction": step.step_description} for step in recipe.recipe_step],
             "tags": [tag.tag_name for tag in recipe.tags],
@@ -335,7 +350,7 @@ def get_recipes():
             "is_favorited": recipe.id in user_favorites,
             "rating": avg_rating,
             "rating_count": len(ratings),
-            "original_recipe_id": recipe.original_recipe_id # Include parent ID for UI logic
+            "original_recipe_id": recipe.original_recipe_id 
         })
 
     return jsonify({
@@ -903,22 +918,60 @@ def update_profile():
     
 ## ADMIN ROUTES ##
 
+from sqlalchemy import or_
+
 @app.route('/api/admin/users', methods=['GET'])
 @jwt_required()
 def get_all_users():
     claims = get_jwt()
-    if claims.get("role") != "admin": return jsonify({"error": "Admin access only"}), 403
-    users = User.query.all()
-    user_list = [{
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "role": user.role,
-        "created_at": user.created_at,
-        "last_login": user.last_login, # Return last_login
-        "recipe_count": len(user.recipe)
-    } for user in users]
-    return jsonify(user_list)
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+    
+    # Get query parameters
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int) # Default 10 users per page
+    search_query = request.args.get('search', '', type=str)
+    
+    # Base query
+    query = User.query
+
+    # Apply Search Filter (Username or Email)
+    if search_query:
+        search = f"%{search_query}%"
+        query = query.filter(
+            or_(
+                User.username.ilike(search),
+                User.email.ilike(search)
+            )
+        )
+    
+    # Apply Pagination
+    # error_out=False returns empty list instead of 404 if page is out of range
+    pagination = query.order_by(User.id).paginate(page=page, per_page=per_page, error_out=False)
+    
+    users = pagination.items
+    result = []
+    
+    for user in users:
+        # Calculate recipe count efficiently for just this page's users
+        recipe_count = Recipe.query.filter_by(user_id=user.id).count()
+        
+        result.append({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": user.role,
+            "last_login": user.last_login,
+            "created_at": user.created_at,
+            "recipe_count": recipe_count
+        })
+    
+    return jsonify({
+        "users": result,
+        "total": pagination.total,
+        "pages": pagination.pages,
+        "current_page": page
+    })
 
 @app.route('/api/admin/users/<int:user_id>/role', methods=['PATCH'])
 @jwt_required()
@@ -1141,6 +1194,545 @@ def analyze_recipe_image():
         except:
             pass
         return jsonify({"error": "Failed to analyze image. Please try again."}), 500
+    
+@app.route('/api/feedback', methods=['POST'])
+@jwt_required()
+def submit_feedback():
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    data = request.get_json()
+    
+    if not data.get('title') or not data.get('description'):
+        return jsonify({"error": "Title and description are required"}), 400
+
+    # 1. Save to Database
+    new_feedback = Feedback(
+        user_id=current_user_id,
+        type=data.get('type', 'feature'), # Default to feature
+        title=data.get('title'),
+        description=data.get('description'),
+        status='new' 
+    )
+    db.session.add(new_feedback)
+    db.session.commit()
+    
+    # 2. Send Email Notification to Admin (You)
+    try:
+        # We send it TO the Mail Username (your email)
+        admin_email = app.config['MAIL_USERNAME'] 
+        
+        msg = Message(
+            subject=f"New {data.get('type').upper()}: {data.get('title')}",
+            recipients=[admin_email],
+            body=f"""
+            New feedback submitted by {user.username} ({user.email}).
+            
+            Type: {data.get('type')}
+            Title: {data.get('title')}
+            
+            Description:
+            {data.get('description')}
+            
+            Log in to your admin panel to review and add to roadmap.
+            """
+        )
+        mail.send(msg)
+    except Exception as e:
+        print(f"Failed to send feedback email: {e}")
+        # We don't fail the request if email fails, just log it
+
+    return jsonify({"message": "Feedback submitted successfully!"}), 201
+
+@app.route('/api/roadmap', methods=['GET'])
+@jwt_required(optional=True)
+def get_roadmap():
+    current_user_id = get_jwt_identity()
+    current_user = User.query.get(current_user_id) if current_user_id else None
+    
+    # Only return items that are active on the roadmap
+    visible_statuses = ['planned', 'in_progress', 'completed']
+    
+    items = Feedback.query.filter(Feedback.status.in_(visible_statuses)).all()
+    
+    roadmap_data = []
+    for item in items:
+        # Calculate upvotes
+        upvote_count = len(item.upvoters)
+        has_upvoted = False
+        if current_user:
+            has_upvoted = current_user in item.upvoters
+
+        roadmap_data.append({
+            "id": item.id,
+            "title": item.title,
+            "description": item.description,
+            "type": item.type,
+            "status": item.status,
+            "date": item.created_at,
+            "upvotes": upvote_count,       # <--- NEW
+            "has_upvoted": has_upvoted     # <--- NEW
+        })
+    
+    # Sort by upvotes (highest first), then by date
+    roadmap_data.sort(key=lambda x: (x['upvotes'], x['date']), reverse=True)
+        
+    return jsonify(roadmap_data)
+
+@app.route('/api/feedback/<int:id>/upvote', methods=['POST'])
+@jwt_required()
+def toggle_upvote(id):
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    item = Feedback.query.get_or_404(id)
+    
+    if user in item.upvoters:
+        item.upvoters.remove(user)
+        action = "removed"
+    else:
+        item.upvoters.append(user)
+        action = "added"
+        
+    db.session.commit()
+    
+    return jsonify({
+        "message": f"Vote {action}", 
+        "upvotes": len(item.upvoters),
+        "has_upvoted": user in item.upvoters
+    })
+
+# Updated Route: Handles Status, Title, AND Description changes
+@app.route('/api/admin/feedback/<int:id>', methods=['PATCH'])
+@jwt_required()
+def update_feedback(id):
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin only"}), 403
+        
+    data = request.get_json()
+    item = Feedback.query.get(id)
+    if not item:
+        return jsonify({"error": "Item not found"}), 404
+    
+    # Update fields if they exist in the request
+    if 'status' in data:
+        item.status = data['status']
+    if 'title' in data:
+        item.title = data['title']
+    if 'description' in data:
+        item.description = data['description']
+    
+    db.session.commit()
+    return jsonify({"message": "Feedback updated successfully"})
+
+
+@app.route('/api/admin/feedback', methods=['GET'])
+@jwt_required()
+def get_all_feedback():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+        
+    # Get params
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    search_query = request.args.get('search', '', type=str)
+    
+    # Base query joined with User so we can search by username/email
+    query = Feedback.query.join(User)
+
+    # Apply Search Filter
+    if search_query:
+        search = f"%{search_query}%"
+        query = query.filter(
+            or_(
+                Feedback.title.ilike(search),
+                Feedback.description.ilike(search),
+                Feedback.type.ilike(search),
+                User.username.ilike(search),
+                User.email.ilike(search)
+            )
+        )
+    
+    # Apply Pagination (Newest first)
+    pagination = query.order_by(Feedback.created_at.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    
+    items = pagination.items
+    result = []
+    for item in items:
+        result.append({
+            "id": item.id,
+            "title": item.title,
+            "description": item.description,
+            "type": item.type,
+            "status": item.status,
+            "submitted_by": item.user.username if item.user else "Unknown",
+            "submitted_by_email": item.user.email if item.user else "",
+            "date": item.created_at
+        })
+        
+    return jsonify({
+        "feedback": result,
+        "total": pagination.total,
+        "pages": pagination.pages,
+        "current_page": page
+    })
+@app.route('/api/admin/feedback/<int:feedback_id>', methods=['DELETE'])
+@jwt_required()
+def delete_feedback(feedback_id):
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+
+    item = Feedback.query.get(feedback_id)
+    if not item:
+        return jsonify({"error": "Not found"}), 404
+
+    db.session.delete(item)
+    db.session.commit()
+    return jsonify({"message": "Feedback deleted"}), 200
+
+@app.route('/api/admin/recipes', methods=['GET'])
+@jwt_required()
+def get_all_recipes_admin():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+        
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    search_query = request.args.get('search', '', type=str)
+    
+    # Join with User to search by author name
+    query = Recipe.query.join(User)
+
+    if search_query:
+        search = f"%{search_query}%"
+        query = query.filter(
+            or_(
+                Recipe.recipe_name.ilike(search),
+                Recipe.recipe_description.ilike(search),
+                User.username.ilike(search)
+            )
+        )
+    
+    # Newest recipes first
+    pagination = query.order_by(Recipe.created_at.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    
+    result = []
+    for recipe in pagination.items:
+        result.append({
+            "id": recipe.id,
+            "recipe_name": recipe.recipe_name,
+            "username": recipe.user.username,
+            "created_at": recipe.created_at,
+            "image": recipe.image[0].image_url if recipe.image else None,
+            "is_featured": recipe.is_featured  # <--- ADD THIS LINE
+        })
+        
+    return jsonify({
+        "recipes": result,
+        "total": pagination.total,
+        "pages": pagination.pages,
+        "current_page": page
+    })
+
+@app.route('/api/admin/analytics', methods=['GET'])
+@jwt_required()
+def get_analytics():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+
+    # 1. KPI Counts
+    total_users = User.query.count()
+    total_recipes = Recipe.query.count()
+    total_feedback = Feedback.query.count()
+    
+    # 2. Top 5 Recipes (Most Favorited)
+    # SAFE VERSION: Joins the user_favorites table explicitly
+    top_recipes_query = db.session.query(
+        Recipe, func.count(user_favorites.c.user_id).label('fav_count')
+    ).join(
+        user_favorites, Recipe.id == user_favorites.c.recipe_id
+    ).group_by(Recipe.id).order_by(desc('fav_count')).limit(5).all()
+    
+    top_recipes = []
+    for r, count in top_recipes_query:
+        top_recipes.append({
+            "id": r.id,
+            "name": r.recipe_name,
+            "author": r.user.username,
+            "count": count
+        })
+
+    # 3. Top 5 Chefs (Most Recipes Uploaded)
+    # SAFE VERSION: Joins Recipe table explicitly
+    top_chefs_query = db.session.query(
+        User, func.count(Recipe.id).label('recipe_count')
+    ).join(
+        Recipe, User.id == Recipe.user_id
+    ).group_by(User.id).order_by(desc('recipe_count')).limit(5).all()
+    
+    top_chefs = []
+    for u, count in top_chefs_query:
+        top_chefs.append({
+            "id": u.id,
+            "username": u.username,
+            "count": count
+        })
+
+    # 4. Tag Distribution (Pie Chart)
+    # SAFE VERSION: Joins recipe_tags table explicitly
+    tag_stats_query = db.session.query(
+        Tag.tag_name, func.count(recipe_tags.c.recipe_id).label('usage_count')
+    ).join(
+        recipe_tags, Tag.id == recipe_tags.c.tag_id
+    ).group_by(Tag.id).order_by(desc('usage_count')).limit(6).all()
+    
+    tag_data = []
+    for name, count in tag_stats_query:
+        tag_data.append({"name": name, "value": count})
+
+    # 5. Monthly Growth (Line Chart)
+    six_months_ago = datetime.utcnow() - timedelta(days=180)
+    
+    new_users = db.session.query(User.created_at).filter(User.created_at >= six_months_ago).all()
+    new_recipes = db.session.query(Recipe.created_at).filter(Recipe.created_at >= six_months_ago).all()
+    
+    def bucket_dates(items):
+        counts = Counter()
+        for item in items:
+            if item[0]:
+                month = item[0].strftime("%b")
+                counts[month] += 1
+        return counts
+
+    user_counts = bucket_dates(new_users)
+    recipe_counts = bucket_dates(new_recipes)
+    
+    chart_data = []
+    for i in range(5, -1, -1):
+        date = datetime.utcnow() - timedelta(days=i*30)
+        month_key = date.strftime("%b")
+        chart_data.append({
+            "name": month_key,
+            "Users": user_counts[month_key],
+            "Recipes": recipe_counts[month_key]
+        })
+
+    return jsonify({
+        "kpi": { "users": total_users, "recipes": total_recipes, "feedback": total_feedback },
+        "top_recipes": top_recipes,
+        "top_chefs": top_chefs,
+        "tag_data": tag_data,
+        "chart_data": chart_data
+    })
+
+@app.route('/api/admin/recipes/<int:recipe_id>/feature', methods=['PATCH'])
+@jwt_required()
+def toggle_recipe_feature(recipe_id):
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+    
+    recipe = Recipe.query.get_or_404(recipe_id)
+    
+    # Toggle the boolean
+    recipe.is_featured = not recipe.is_featured
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Recipe updated", 
+        "is_featured": recipe.is_featured,
+        "recipe_name": recipe.recipe_name
+    }), 200
+
+@app.route('/api/recipes/featured', methods=['GET'])
+def get_featured_recipes():
+    # Fetch random 5 featured recipes to keep it fresh
+    recipes = Recipe.query.filter_by(is_featured=True).order_by(func.random()).limit(5).all()
+    # ... serialize and return them ...
+    return jsonify([r.to_dict() for r in recipes])
+
+# 1. Get All Tags with Usage Counts
+@app.route('/api/admin/tags', methods=['GET'])
+@jwt_required()
+def get_admin_tags():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+    
+    # Query all tags and count how many recipes use them
+    # We join with recipe_tags table to get the count
+    tags = db.session.query(
+        Tag, func.count(recipe_tags.c.recipe_id).label('usage_count')
+    ).outerjoin(recipe_tags).group_by(Tag.id).order_by(Tag.tag_name.asc()).all()
+    
+    result = []
+    for tag, count in tags:
+        result.append({
+            "id": tag.id,
+            "name": tag.tag_name,
+            "count": count
+        })
+    
+    return jsonify(result)
+
+# 2. Delete a Tag
+@app.route('/api/admin/tags/<int:tag_id>', methods=['DELETE'])
+@jwt_required()
+def delete_tag(tag_id):
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+        
+    tag = Tag.query.get_or_404(tag_id)
+    db.session.delete(tag)
+    db.session.commit()
+    return jsonify({"message": "Tag deleted successfully"}), 200
+
+# 3. Merge Tags
+@app.route('/api/admin/tags/merge', methods=['POST'])
+@jwt_required()
+def merge_tags():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+        
+    data = request.get_json()
+    source_id = data.get('source_id') # The tag to delete (e.g., "Veggie")
+    target_id = data.get('target_id') # The tag to keep (e.g., "Vegetarian")
+    
+    if not source_id or not target_id:
+        return jsonify({"error": "Missing source or target tag ID"}), 400
+        
+    if source_id == target_id:
+        return jsonify({"error": "Cannot merge a tag into itself"}), 400
+
+    source_tag = Tag.query.get_or_404(source_id)
+    target_tag = Tag.query.get_or_404(target_id)
+    
+    # Logic: Find all recipes that have the source_tag.
+    # If they don't already have the target_tag, add it.
+    # Then remove source_tag association.
+    
+    # Get all recipes associated with the source tag
+    # Using explicit query on the secondary table is safest
+    recipes_with_source = Recipe.query.filter(Recipe.tags.any(id=source_id)).all()
+    
+    for recipe in recipes_with_source:
+        # Check if recipe already has the target tag
+        if target_tag not in recipe.tags:
+            recipe.tags.append(target_tag)
+        
+        # Remove the source tag
+        if source_tag in recipe.tags:
+            recipe.tags.remove(source_tag)
+            
+    # Finally, delete the source tag completely
+    db.session.delete(source_tag)
+    db.session.commit()
+    
+    return jsonify({"message": f"Merged '{source_tag.tag_name}' into '{target_tag.tag_name}'"}), 200
+
+@app.route('/api/announcement', methods=['GET'])
+def get_announcement():
+    setting = SiteSetting.query.filter_by(key='banner').first()
+    if setting and setting.value:
+        return jsonify(json.loads(setting.value))
+    # Default empty
+    return jsonify({"message": "", "type": "info", "active": False})
+
+# 2. ADMIN: Update Banner
+@app.route('/api/admin/announcement', methods=['PUT'])
+@jwt_required()
+def update_announcement():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+        
+    data = request.get_json()
+    # Expecting: { "message": "...", "type": "info/warning/error", "active": true/false }
+    
+    setting = SiteSetting.query.filter_by(key='banner').first()
+    if not setting:
+        setting = SiteSetting(key='banner')
+        db.session.add(setting)
+        
+    setting.value = json.dumps(data)
+    db.session.commit()
+    
+    return jsonify({"message": "Banner updated successfully"}), 200
+
+@app.route('/api/admin/export/recipes', methods=['GET'])
+@jwt_required()
+def export_recipes_csv():
+    claims = get_jwt()
+    if claims.get("role") != "admin":
+        return jsonify({"error": "Admin access only"}), 403
+
+    # 1. Fetch all recipes
+    recipes = Recipe.query.order_by(Recipe.created_at.desc()).all()
+
+    # 2. Create CSV in memory
+    si = io.StringIO()
+    cw = csv.writer(si)
+    
+    # 3. Write Header (Added Ingredients and Steps)
+    cw.writerow([
+        'ID', 'Recipe Name', 'Author', 'Created At', 
+        'Prep Time', 'Cook Time', 'Difficulty', 
+        'Rating', 'Favorites', 'Is Featured', 
+        'Ingredients', 'Directions'  # <--- NEW COLUMNS
+    ])
+
+    # 4. Write Rows
+    for r in recipes:
+        # Calculate Rating
+        avg_rating = 0
+        if r.ratings:
+            avg_rating = round(sum([x.score for x in r.ratings]) / len(r.ratings), 1)
+            
+        # --- FORMAT INGREDIENTS ---
+        # Format: "2 cup Flour | 1 tsp Salt"
+        ing_list = []
+        for ri in r.recipe_ingredient:
+            # Handle cases where unit might be None
+            unit = ri.measurement.measurement_name if ri.measurement else ""
+            # Construct string: "2 cup Flour"
+            item_str = f"{ri.ingredient_quantity} {unit} {ri.ingredient.ingredient_name}".strip()
+            ing_list.append(item_str)
+        ingredients_str = " | ".join(ing_list)
+
+        # --- FORMAT STEPS ---
+        # Format: "1. Mix bowl | 2. Bake"
+        step_list = []
+        # Ensure steps are in order
+        sorted_steps = sorted(r.recipe_step, key=lambda x: x.step_number)
+        for step in sorted_steps:
+            step_list.append(f"{step.step_number}. {step.step_description}")
+        steps_str = " | ".join(step_list)
+
+        cw.writerow([
+            r.id,
+            r.recipe_name,
+            r.user.username if r.user else "Unknown",
+            r.created_at.strftime('%Y-%m-%d'),
+            r.prep_time,
+            r.cook_time,
+            r.difficulty,
+            avg_rating,
+            len(r.favorited_by), 
+            "Yes" if r.is_featured else "No",
+            ingredients_str, # <--- Added here
+            steps_str        # <--- Added here
+        ])
+
+    # 5. Create Response
+    output = make_response(si.getvalue())
+    output.headers["Content-Disposition"] = "attachment; filename=cookbook_export.csv"
+    output.headers["Content-type"] = "text/csv"
+    return output
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000, debug=True)

@@ -19,6 +19,7 @@ class Recipe(db.Model):
     difficulty = db.Column(db.String(20))
     created_at = db.Column(db.DateTime, default=datetime.utcnow) 
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow) 
+    is_featured = db.Column(db.Boolean, default=False)
 
     # Relationships
     recipe_ingredient = db.relationship('RecipeIngredient', back_populates='recipe', cascade="all, delete-orphan")

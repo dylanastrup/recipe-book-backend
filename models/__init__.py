@@ -23,3 +23,5 @@ from .RecipeStep import RecipeStep
 from .Image import Image
 from .Tag import Tag
 from .Rating import Rating 
+from .Feedback import Feedback
+from .SiteSetting import SiteSetting
