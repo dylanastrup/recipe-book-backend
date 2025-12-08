@@ -376,7 +376,7 @@ def create_recipe():
             prep_time=data['prep_time'],
             cook_time=data['cook_time'],
             servings=data['servings'],
-            difficulty=data['difficulty']
+            difficulty=data['difficulty'],
             is_featured=False, 
             original_recipe_id=None
         )
