@@ -377,6 +377,8 @@ def create_recipe():
             cook_time=data['cook_time'],
             servings=data['servings'],
             difficulty=data['difficulty']
+            is_featured=False, 
+            original_recipe_id=None
         )
         db.session.add(new_recipe)
         db.session.flush()
