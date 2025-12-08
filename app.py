@@ -8,6 +8,7 @@ import json
 import tempfile
 import io
 import csv
+import threading
 
 # AI and Scraping Imports
 from recipe_scrapers import scrape_me
@@ -114,6 +115,34 @@ def normalize_ingredient(name):
     if singular:
         return singular
     return clean
+
+def send_feedback_notification_async(app, feedback_data, user_data):
+    # This context is necessary for Flask-Mail to work in a separate thread
+    with app.app_context():
+        try:
+            admin_email = app.config['MAIL_USERNAME'] 
+            
+            msg = Message(
+                subject=f"New {feedback_data.get('type').upper()}: {feedback_data.get('title')}",
+                recipients=[admin_email],
+                body=f"""
+                New feedback submitted by {user_data.username} ({user_data.email}).
+                
+                Type: {feedback_data.get('type')}
+                Title: {feedback_data.get('title')}
+                
+                Description:
+                {feedback_data.get('description')}
+                
+                Log in to your admin panel to review and add to roadmap.
+                """
+            )
+            # 'mail' object must be available globally, assuming you imported it earlier
+            from app import mail 
+            mail.send(msg)
+        except Exception as e:
+            # This will log the error on the server side without blocking the user
+            print(f"Failed to send feedback email asynchronously: {e}")
 
 
 # --- API ROUTES ---
@@ -1216,34 +1245,19 @@ def submit_feedback():
         status='new' 
     )
     db.session.add(new_feedback)
-    db.session.commit()
+    db.session.commit() # SUCCESSFUL COMMIT HERE!
     
-    # 2. Send Email Notification to Admin (You)
-    try:
-        # We send it TO the Mail Username (your email)
-        admin_email = app.config['MAIL_USERNAME'] 
-        
-        msg = Message(
-            subject=f"New {data.get('type').upper()}: {data.get('title')}",
-            recipients=[admin_email],
-            body=f"""
-            New feedback submitted by {user.username} ({user.email}).
-            
-            Type: {data.get('type')}
-            Title: {data.get('title')}
-            
-            Description:
-            {data.get('description')}
-            
-            Log in to your admin panel to review and add to roadmap.
-            """
-        )
-        mail.send(msg)
-    except Exception as e:
-        print(f"Failed to send feedback email: {e}")
-        # We don't fail the request if email fails, just log it
+    # 2. Start Email Notification in a Background Thread (Non-Blocking)
+    app_context = app # Pass the Flask app object
+    
+    thread = threading.Thread(
+        target=send_feedback_notification_async,
+        args=(app_context, data, user)
+    )
+    thread.start()
 
-    return jsonify({"message": "Feedback submitted successfully!"}), 201
+    # 3. Immediately Return Success Response (The Fix)
+    return jsonify({"message": "Feedback submitted successfully! (Email sending in background)"}), 201
 
 @app.route('/api/roadmap', methods=['GET'])
 @jwt_required(optional=True)
